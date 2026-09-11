@@ -4,13 +4,13 @@ cd /d "%~dp0"
 
 where py >nul 2>nul
 if %errorlevel%==0 (
-    py main.py
+    py main_multi.py
     goto :end
 )
 
 where python >nul 2>nul
 if %errorlevel%==0 (
-    python main.py
+    python main_multi.py
     goto :end
 )
 
