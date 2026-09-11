@@ -1,26 +1,40 @@
-# Scratch Comment Bot v3
+# Scratch Comment Bot v6 - Unlimited Reservations
 
-Scratchの **Project / Studio** のどちらかを投稿先として指定し、
-決まった時刻にコメントを投稿できるPythonツールです。
+Scratch の **Project / Studio / Profile** にコメントできる Python ツールです。
+予約は **毎日1回・終了日なし（無期限）** で、予約を OFF または削除するまで続きます。
 
-## v3の追加機能
+## v6 の主な機能
 
-- Projectを投稿先に設定
-- Studioを投稿先に設定
-- 予約ごとに投稿先を保存
-- ProjectとStudioの予約を混在可能
-- 今すぐ投稿でもProject / Studioを選択可能
-- v2の古いProject予約も自動で引き継ぎ
+- Project / Studio / Profile へのコメント投稿
+- Profile はユーザー名またはプロフィールURLを指定可能
+- Project / Studio はIDまたはURLを指定可能
+- Scratch URLから投稿先を自動判定
+- **毎日・無期限予約**
+- **予約件数はアプリ側の固定上限なし**
+- 指定した時刻に1日1回だけ投稿
+- 予約内容（投稿先・時刻・コメント）の編集
+- 予約の ON / OFF
+- 予約削除
+- 投稿先の接続確認
+- 投稿履歴を `post_log.jsonl` に保存
+- 500文字を超えるコメントを事前に検出
+- 旧バージョンの予約は「毎日・無期限」に自動移行
+- 同じ予約は同じ日に2回実行しない
+- 自動投稿時は最低15秒の間隔を維持
 
 ## インストール
 
+Windowsでは `install.bat` をダブルクリックしてください。
+
+または:
+
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ## 起動
 
-`start.bat`
+`start.bat` をダブルクリックします。
 
 または:
 
@@ -28,36 +42,43 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## 予約例：Project
+## 毎日・無期限予約の例
 
 ```text
+1. 毎日・無期限予約を追加
+
 投稿先を選択
 1. Project
 2. Studio
-選択 > 1
+3. Profile
+4. URLから自動判定
+選択 > 3
 
-プロジェクトID: 123456789
-投稿時刻: 18:30
-投稿するコメント: 今日もよろしく！
+Scratchユーザー名 またはプロフィールURL: ExampleUser
+
+予約方式: 毎日・無期限（終了日なし）
+投稿時刻 (HH:MM 例 18:30): 18:30
+投稿するコメント: こんにちは！
+
+毎日・無期限予約を追加しました。
+この予約はOFFまたは削除するまで毎日続きます。
 ```
 
-## 予約例：Studio
+## 重要
 
-```text
-投稿先を選択
-1. Project
-2. Studio
-選択 > 2
-
-Studio ID: 987654321
-投稿時刻: 20:00
-投稿するコメント: 今日の更新です！
-```
-
-## 注意
-
-- 自動投稿中はPCとBotを起動したままにしてください。
+- 予約は終了日を持ちません。
+- 保存できる予約件数に、このツール側の固定上限は設定していません。
+- ただしPC性能・ファイルサイズ・Scratch側の制限など、現実上の上限はあります。
+- 毎日、指定時刻に最大1回だけ実行します。
+- 停止したい場合はメニューの `投稿予約をON/OFF` でOFFにするか、予約を削除します。
+- 自動投稿中はPCとこのツールを起動したままにしてください。
 - PCがスリープ・シャットダウン中は投稿できません。
-- Scratchパスワードはファイル保存しません。
-- Scratch側でコメントが無効な投稿先には投稿できません。
-- Scratch側の投稿制限やミュートは回避しません。
+- Scratch側のコメント無効設定・ミュート・認証・レート制限は回避しません。
+
+## データファイル
+
+- `schedules.json` : 毎日・無期限予約一覧
+- `schedule_state.json` : 同じ日に重複実行しないための状態
+- `post_log.jsonl` : 投稿成功 / 失敗の履歴
+
+Scratchのパスワードはこれらのファイルには保存しません。
