@@ -1,0 +1,14 @@
+{
+  "name": "scratch-comment-bot-worker-js",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker版 Scratchコメント投稿キュー・所有スタジオ整理ツール",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.35.0"
+  }
+}
