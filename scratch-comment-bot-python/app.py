@@ -6,6 +6,7 @@ import random
 import re
 import threading
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1431,4 +1432,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8765"))
     print(f"Scratch Comment Bot: http://{host}:{port}/")
     print("パスワードは保存せず、ログイン中だけメモリに保持します。")
+    open_browser = os.environ.get("OPEN_BROWSER", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if open_browser:
+        browser_timer = threading.Timer(1.0, lambda: webbrowser.open(f"http://{host}:{port}/"))
+        browser_timer.daemon = True
+        browser_timer.start()
     app.run(host=host, port=port, debug=False)

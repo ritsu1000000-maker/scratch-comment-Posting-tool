@@ -4,7 +4,7 @@
 
 ## 起動
 
-Windowsでは `start.bat` をダブルクリックします。手動なら次のコマンドです。
+Windowsでは `start.bat` をダブルクリックします。起動後、ブラウザを自動で`http://127.0.0.1:8765/`に開きます。手動なら次のコマンドです。
 
 ```powershell
 python -m pip install -r requirements.txt
