@@ -19,11 +19,24 @@ Python版をCloudflare Workers用のJavaScriptへ移した構成です。`src/in
 
 Node.js 18以上を用意し、このフォルダで実行します。
 
+### Windowsでローカル起動
+
+ZIPを展開したフォルダの`start.bat`をダブルクリックしてください。初回だけ依存関係をインストールし、`http://localhost:8787/`でWorkerを起動します。バッチがすぐ閉じる場合も、エラーを表示して停止するようにしています。
+
+```text
+npm install
+npm run dev
+```
+
+### Cloudflareへ公開
+
 ```text
 npm install
 npx wrangler login
 npx wrangler deploy
 ```
+
+`start.bat`はローカル起動用で、Cloudflareへの公開は行いません。
 
 `wrangler.jsonc`のWorker名は、既存の`scratch-comment-bot-web`に合わせています。別Workerにしたいときだけ`name`を変更してください。APIトークンやパスワードをチャットへ貼り付けないでください。
 
