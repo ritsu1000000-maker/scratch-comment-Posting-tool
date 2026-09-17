@@ -1149,6 +1149,34 @@ def start_queue():
     return jsonify({"ok": True, "startedAt": batch_started, "count": len(item_ids)})
 
 
+@app.post("/api/queue/repeat")
+def repeat_queue():
+    global queue_running, queue_batch_started_at
+    with queue_lock:
+        if queue_running:
+            return json_error("一括投稿はすでに実行中です。")
+        if not queue_items:
+            return json_error("繰り返す投稿キューがありません。")
+        if all(item.get("status") == "queued" for item in queue_items):
+            return json_error("まだ実行済みのキューがありません。一括開始を使ってください。")
+
+        queue_running = True
+        queue_batch_started_at = time.time()
+        batch_started = queue_batch_started_at
+        item_ids = []
+        for item in queue_items:
+            item["status"] = "waiting"
+            item["sent"] = []
+            item["failed"] = []
+            item.pop("startedAt", None)
+            item.pop("finishedAt", None)
+            item_ids.append(int(item["id"]))
+
+        thread = threading.Thread(target=run_queue, args=(batch_started, item_ids), daemon=True)
+        thread.start()
+    return jsonify({"ok": True, "startedAt": batch_started, "count": len(item_ids)})
+
+
 @app.post("/api/queue/stop")
 def stop_queue():
     global queue_running

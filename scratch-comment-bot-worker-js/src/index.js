@@ -641,6 +641,26 @@ export default {
         ctx.waitUntil(runQueue(state, startedAt, ids));
         return jsonResponse({ok: true, count: ids.length, startedAt}, 200, context);
       }
+      if (url.pathname === "/api/queue/repeat") {
+        if (state.queueRunning) fail("一括投稿はすでに実行中です。", 409);
+        if (!state.queue.length) fail("繰り返す投稿キューがありません。");
+        if (state.queue.every(item => item.status === "queued")) fail("まだ実行済みのキューがありません。一括開始を使ってください。");
+
+        state.queueRunning = true;
+        state.queueStopRequested = false;
+        state.queueBatchStartedAt = Date.now();
+        const startedAt = state.queueBatchStartedAt;
+        const ids = state.queue.map(item => {
+          item.status = "waiting";
+          item.sent = [];
+          item.failed = [];
+          delete item.startedAt;
+          delete item.finishedAt;
+          return item.id;
+        });
+        ctx.waitUntil(runQueue(state, startedAt, ids));
+        return jsonResponse({ok: true, count: ids.length, startedAt}, 200, context);
+      }
       if (url.pathname === "/api/queue/stop") {
         state.queueStopRequested = true;
         for (const item of state.queue) if (item.status === "waiting") item.status = "cancelled";

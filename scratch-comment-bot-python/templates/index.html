@@ -263,10 +263,11 @@ bot.run()</pre>
             <div id="queue-list"><div class="empty">キューは空です。</div></div>
             <div class="queue-actions">
               <button class="primary" id="queue-start" disabled>一括開始</button>
+              <button id="queue-repeat" disabled>もう一度繰り返す</button>
               <button id="queue-stop" disabled>一括停止</button>
               <button class="danger" id="queue-clear" disabled>キューを空にする</button>
             </div>
-            <div class="help">追加したコメントは、ここで「一括開始」を押すまで投稿されません。</div>
+            <div class="help">追加したコメントは、ここで「一括開始」を押すまで投稿されません。「もう一度繰り返す」は、実行済みの同じキューを1周だけ再実行します。</div>
           </div>
         </section>
         <section class="section studio-card">
@@ -347,7 +348,7 @@ bot.run()</pre>
       document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>run(b,async()=>{await api(`/api/schedules/${b.dataset.id}/${b.dataset.action}`,{method:'POST',body:'{}'});notice(b.dataset.action==='delete'?'予約を削除しました。':'予約のON/OFFを変更しました。');await refresh()}));
       const queueRows=state.queue.map(q=>{const remaining=q.remainingSeconds!=null?`・あと${q.remainingSeconds}秒`:'';const error=(q.failed||[]).map(x=>x.error||'').filter(Boolean).join('; ');return `<div class="queue-item"><div class="queue-item-head"><strong>#${q.id}　${esc(targetLabel[q.targetType]||q.targetType)} ${esc(q.targetId)}</strong><span class="queue-status ${esc(q.status)}">${queueStatus[q.status]||esc(q.status)}${remaining}</span></div><div class="queue-meta"><span>${esc(q.accountUsername)}</span><span>開始から${esc(q.delaySeconds)}秒後</span></div><div class="queue-message">${esc(q.message)}</div>${error?`<div class="help" style="color:var(--danger)">${esc(error)}</div>`:''}${q.status==='queued'?`<div class="inline-actions" style="margin-top:8px"><button class="danger" data-q-delete="${q.id}">削除</button></div>`:''}</div>`}).join('');
       $('#queue-list').innerHTML=queueRows?`<div class="queue-list">${queueRows}</div>`:'<div class="empty">キューは空です。</div>';
-      $('#queue-start').disabled=state.queueRunning||!state.queue.some(q=>q.status==='queued'); $('#queue-stop').disabled=!state.queueRunning; $('#queue-clear').disabled=state.queueRunning||!state.queue.length;
+      $('#queue-start').disabled=state.queueRunning||!state.queue.some(q=>q.status==='queued'); $('#queue-repeat').disabled=state.queueRunning||!state.queue.length||state.queue.every(q=>q.status==='queued'); $('#queue-stop').disabled=!state.queueRunning; $('#queue-clear').disabled=state.queueRunning||!state.queue.length;
       document.querySelectorAll('[data-q-delete]').forEach(b=>b.onclick=()=>run(b,async()=>{await api(`/api/queue/${b.dataset.qDelete}/delete`,{method:'POST',body:'{}'});notice('キューから削除しました。');await refresh()}));
       const reactionTypeLabel={keyword:'キーワードに固定返信',random_reply:'キーワードにランダム返信',lottery:'キーワードにランダム返信'};
       const matchLabel={contains:'含む',exact:'完全一致',any:'すべて'};
@@ -395,6 +396,7 @@ bot.run()</pre>
     async function run(button,fn){button.disabled=true;try{await fn()}catch(e){notice(e.message,'error')}finally{button.disabled=false}}
     $('#post-form').onsubmit=e=>{e.preventDefault();run(e.submitter,async()=>{await api('/api/queue',{method:'POST',body:JSON.stringify(formData(e.target))});notice('投稿キューに追加しました。');e.target.reset();e.target.elements.delaySeconds.value='0';await refresh()})};
     $('#queue-start').onclick=()=>run($('#queue-start'),async()=>{const r=await api('/api/queue/start',{method:'POST',body:'{}'});notice(`${r.count}件の一括投稿を開始しました。`);await refresh()});
+    $('#queue-repeat').onclick=()=>run($('#queue-repeat'),async()=>{const r=await api('/api/queue/repeat',{method:'POST',body:'{}'});notice(`${r.count}件の投稿キューをもう1周開始しました。`);await refresh()});
     $('#queue-stop').onclick=()=>run($('#queue-stop'),async()=>{await api('/api/queue/stop',{method:'POST',body:'{}'});notice('一括投稿を停止しました。');await refresh()});
     $('#queue-clear').onclick=()=>run($('#queue-clear'),async()=>{await api('/api/queue/clear',{method:'POST',body:'{}'});notice('キューを空にしました。');await refresh()});
     $('#studio-form').onsubmit=e=>{e.preventDefault();run(e.submitter,async()=>{const r=await api('/api/studio/inspect',{method:'POST',body:JSON.stringify(formData(e.target))});studioView=r.studio;notice('所有スタジオを読み込みました。');renderStudio()})};
