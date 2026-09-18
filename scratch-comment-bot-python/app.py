@@ -1457,7 +1457,7 @@ def schedule_action(schedule_id: int, action: str):
 if __name__ == "__main__":
     threading.Thread(target=scheduler_loop, daemon=True, name="daily-scheduler").start()
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8765"))
+    port = int(os.environ.get("PORT", "8876"))
     print(f"Scratch Comment Bot: http://{host}:{port}/")
     print("パスワードは保存せず、ログイン中だけメモリに保持します。")
     open_browser = os.environ.get("OPEN_BROWSER", "1").strip().lower() not in {"0", "false", "no", "off"}
