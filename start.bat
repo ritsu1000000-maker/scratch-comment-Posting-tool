@@ -3,8 +3,12 @@ setlocal
 cd /d "%~dp0"
 title Scratch Comment Bot - Web UI
 
+rem Avoid collisions with other local web apps that may already use port 8765.
+set PORT=8876
+
 echo ================================================
 echo  Scratch Comment Bot - Web UI
+echo  http://127.0.0.1:%PORT%/
 echo  Browser will open automatically.
 echo ================================================
 echo.
