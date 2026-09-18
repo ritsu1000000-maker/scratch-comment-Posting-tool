@@ -4,16 +4,19 @@ import json
 import os
 import random
 import re
+import secrets
 import threading
 import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, jsonify, render_template, request
+from werkzeug.local import LocalProxy
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,35 +42,153 @@ def disable_browser_cache(response):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
+    client_id = getattr(g, "client_id", None)
+    if client_id and request.cookies.get(CLIENT_COOKIE_NAME) != client_id:
+        response.set_cookie(
+            CLIENT_COOKIE_NAME,
+            client_id,
+            max_age=60 * 60 * 24 * 365,
+            httponly=True,
+            secure=request.is_secure,
+            samesite="Lax",
+            path="/",
+        )
     return response
 
 
-# セッションはメモリにだけ保持する。パスワードは保存しない。
-sessions: dict[str, Any] = {}
-sessions_lock = threading.RLock()
-post_lock = threading.Lock()
-last_post_at = 0.0
-studio_action_lock = threading.Lock()
-last_studio_action_at = 0.0
-studio_bulk_state_lock = threading.RLock()
-studio_bulk_job: dict[str, Any] | None = None
-studio_bulk_stop_event: threading.Event | None = None
-studio_bulk_thread: threading.Thread | None = None
+# 公開環境ではブラウザごとに匿名client_idを割り当て、状態を完全分離する。
+CLIENT_COOKIE_NAME = "scb_client"
+CLIENT_DATA_ROOT = Path(os.environ.get("SCB_DATA_DIR", str(BASE_DIR / "client-data")))
+CLIENT_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
-queue_items: list[dict[str, Any]] = []
-queue_lock = threading.RLock()
-schedules_lock = threading.RLock()
-queue_running = False
-queue_batch_started_at: float | None = None
+_client_context: ContextVar[str | None] = ContextVar("scb_client_id", default=None)
+_client_states: dict[str, "ClientState"] = {}
+_client_states_lock = threading.RLock()
+_scheduler_thread: threading.Thread | None = None
+_scheduler_thread_lock = threading.Lock()
 
-reaction_rules: list[dict[str, Any]] = []
-reaction_state: dict[str, Any] = {}
-reaction_lock = threading.RLock()
-reaction_running = False
-reaction_stop_event = threading.Event()
-reaction_thread: threading.Thread | None = None
-reaction_due_at: dict[str, float] = {}
 
+def _valid_client_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{24,80}", value or ""))
+
+
+def _load_list_file(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _load_reaction_state_file(path: Path) -> dict[str, Any]:
+    empty = {"initialized": {}, "seen": {}, "pending": {}, "pool": {}}
+    if not path.exists():
+        return empty
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            return empty
+        for key in empty:
+            if not isinstance(value.get(key), dict):
+                value[key] = {}
+        return value
+    except (OSError, json.JSONDecodeError):
+        return empty
+
+
+class ClientState:
+    def __init__(self, client_id: str):
+        self.client_id = client_id
+        self.data_dir = CLIENT_DATA_ROOT / client_id
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.schedule_file = self.data_dir / "schedules.json"
+        self.reaction_file = self.data_dir / "reactions.json"
+        self.reaction_state_file = self.data_dir / "reaction_state.json"
+
+        self.sessions: dict[str, Any] = {}
+        self.sessions_lock = threading.RLock()
+        self.post_lock = threading.Lock()
+        self.last_post_at = 0.0
+
+        self.studio_action_lock = threading.Lock()
+        self.last_studio_action_at = 0.0
+        self.studio_bulk_state_lock = threading.RLock()
+        self.studio_bulk_job: dict[str, Any] | None = None
+        self.studio_bulk_stop_event: threading.Event | None = None
+        self.studio_bulk_thread: threading.Thread | None = None
+
+        self.queue_items: list[dict[str, Any]] = []
+        self.queue_lock = threading.RLock()
+        self.queue_running = False
+        self.queue_batch_started_at: float | None = None
+
+        self.schedules_lock = threading.RLock()
+        self.schedules = _load_list_file(self.schedule_file)
+
+        self.reaction_rules = _load_list_file(self.reaction_file)
+        self.reaction_state = _load_reaction_state_file(self.reaction_state_file)
+        self.reaction_lock = threading.RLock()
+        self.reaction_running = False
+        self.reaction_stop_event = threading.Event()
+        self.reaction_thread: threading.Thread | None = None
+        self.reaction_due_at: dict[str, float] = {}
+
+
+def get_client_state(client_id: str | None = None) -> ClientState:
+    client_id = client_id or _client_context.get()
+    if not client_id or not _valid_client_id(client_id):
+        raise RuntimeError("クライアント状態を特定できません。")
+    with _client_states_lock:
+        state = _client_states.get(client_id)
+        if state is None:
+            state = ClientState(client_id)
+            _client_states[client_id] = state
+        return state
+
+
+def current_client_id() -> str:
+    client_id = _client_context.get()
+    if not client_id:
+        raise RuntimeError("クライアントIDがありません。")
+    return client_id
+
+
+def run_for_client(client_id: str, target, *args) -> None:
+    token = _client_context.set(client_id)
+    try:
+        target(*args)
+    finally:
+        _client_context.reset(token)
+
+
+@app.before_request
+def bind_client_state():
+    client_id = str(request.cookies.get(CLIENT_COOKIE_NAME) or "")
+    if not _valid_client_id(client_id):
+        client_id = secrets.token_urlsafe(24)
+    g.client_id = client_id
+    _client_context.set(client_id)
+    get_client_state(client_id)
+    ensure_scheduler_thread()
+
+
+# 補助関数はLocalProxy経由で現在のブラウザの状態だけを見る。
+sessions = LocalProxy(lambda: get_client_state().sessions)
+sessions_lock = LocalProxy(lambda: get_client_state().sessions_lock)
+post_lock = LocalProxy(lambda: get_client_state().post_lock)
+studio_action_lock = LocalProxy(lambda: get_client_state().studio_action_lock)
+studio_bulk_state_lock = LocalProxy(lambda: get_client_state().studio_bulk_state_lock)
+queue_items = LocalProxy(lambda: get_client_state().queue_items)
+queue_lock = LocalProxy(lambda: get_client_state().queue_lock)
+schedules = LocalProxy(lambda: get_client_state().schedules)
+schedules_lock = LocalProxy(lambda: get_client_state().schedules_lock)
+reaction_rules = LocalProxy(lambda: get_client_state().reaction_rules)
+reaction_state = LocalProxy(lambda: get_client_state().reaction_state)
+reaction_lock = LocalProxy(lambda: get_client_state().reaction_lock)
+reaction_stop_event = LocalProxy(lambda: get_client_state().reaction_stop_event)
+reaction_due_at = LocalProxy(lambda: get_client_state().reaction_due_at)
 
 def json_error(message: str, status: int = 400):
     return jsonify({"error": message}), status
@@ -247,20 +368,18 @@ def studio_snapshot(username: str, studio: Any) -> dict[str, Any]:
 
 
 def wait_for_studio_action(stop_event: threading.Event | None = None) -> bool:
-    """整理操作を直列化し、短時間の連続リクエストを抑える。"""
-    global last_studio_action_at
-    with studio_action_lock:
-        wait_for = STUDIO_ACTION_INTERVAL - (time.monotonic() - last_studio_action_at)
+    state = get_client_state()
+    with state.studio_action_lock:
+        wait_for = STUDIO_ACTION_INTERVAL - (time.monotonic() - state.last_studio_action_at)
         while wait_for > 0:
             if stop_event is not None and stop_event.is_set():
                 return False
             time.sleep(min(0.25, wait_for))
-            wait_for = STUDIO_ACTION_INTERVAL - (time.monotonic() - last_studio_action_at)
+            wait_for = STUDIO_ACTION_INTERVAL - (time.monotonic() - state.last_studio_action_at)
         if stop_event is not None and stop_event.is_set():
             return False
-        last_studio_action_at = time.monotonic()
+        state.last_studio_action_at = time.monotonic()
         return True
-
 
 def studio_action_members(studio: Any, kind: str) -> list[Any]:
     if kind == "projects":
@@ -318,31 +437,31 @@ def studio_bulk_apply(studio: Any, kind: str, target: str) -> None:
 
 
 def studio_bulk_job_for_client() -> dict[str, Any] | None:
-    """一括解除ジョブの状態を画面へ返す（内部オブジェクトは返さない）。"""
-    with studio_bulk_state_lock:
-        if studio_bulk_job is None:
+    state = get_client_state()
+    with state.studio_bulk_state_lock:
+        job = state.studio_bulk_job
+        if job is None:
             return None
         return {
-            "status": studio_bulk_job.get("status"),
-            "accountUsername": studio_bulk_job.get("accountUsername"),
-            "studioId": studio_bulk_job.get("studioId"),
-            "kind": studio_bulk_job.get("kind"),
-            "label": studio_bulk_job.get("label"),
-            "total": int(studio_bulk_job.get("total", 0)),
-            "completed": int(studio_bulk_job.get("completed", 0)),
-            "removed": list(studio_bulk_job.get("removed", [])),
-            "failed": list(studio_bulk_job.get("failed", [])),
-            "current": studio_bulk_job.get("current"),
-            "startedAt": studio_bulk_job.get("startedAt"),
-            "finishedAt": studio_bulk_job.get("finishedAt"),
+            "status": job.get("status"),
+            "accountUsername": job.get("accountUsername"),
+            "studioId": job.get("studioId"),
+            "kind": job.get("kind"),
+            "label": job.get("label"),
+            "total": int(job.get("total", 0)),
+            "completed": int(job.get("completed", 0)),
+            "removed": list(job.get("removed", [])),
+            "failed": list(job.get("failed", [])),
+            "current": job.get("current"),
+            "startedAt": job.get("startedAt"),
+            "finishedAt": job.get("finishedAt"),
         }
 
-
 def set_studio_bulk_job(job_ref: dict[str, Any] | None = None, **changes: Any) -> None:
-    with studio_bulk_state_lock:
-        if studio_bulk_job is not None and (job_ref is None or studio_bulk_job is job_ref):
-            studio_bulk_job.update(changes)
-
+    state = get_client_state()
+    with state.studio_bulk_state_lock:
+        if state.studio_bulk_job is not None and (job_ref is None or state.studio_bulk_job is job_ref):
+            state.studio_bulk_job.update(changes)
 
 def run_studio_bulk_remove(
     username: str,
@@ -368,13 +487,13 @@ def run_studio_bulk_remove(
                 studio_bulk_apply(studio, kind, target)
             except Exception as exc:
                 with studio_bulk_state_lock:
-                    if studio_bulk_job is job_ref:
+                    if get_client_state().studio_bulk_job is job_ref:
                         job_ref["status"] = "failed"
                         job_ref["current"] = None
                         job_ref["failed"].append({"id": target, "error": str(exc)})
                 break
             with studio_bulk_state_lock:
-                if studio_bulk_job is job_ref:
+                if get_client_state().studio_bulk_job is job_ref:
                     job_ref["removed"].append(target)
                     job_ref["completed"] += 1
                     job_ref["current"] = None
@@ -382,13 +501,13 @@ def run_studio_bulk_remove(
             set_studio_bulk_job(job_ref, status="completed", current=None)
     except Exception as exc:
         with studio_bulk_state_lock:
-            if studio_bulk_job is job_ref:
+            if get_client_state().studio_bulk_job is job_ref:
                 job_ref["status"] = "failed"
                 job_ref["current"] = None
                 job_ref["failed"].append({"id": None, "error": str(exc)})
     finally:
         with studio_bulk_state_lock:
-            if studio_bulk_job is job_ref:
+            if get_client_state().studio_bulk_job is job_ref:
                 if job_ref.get("status") == "running" and stop_event.is_set():
                     job_ref["status"] = "stopped"
                 job_ref["finishedAt"] = datetime.now(JST).isoformat(timespec="seconds")
@@ -403,41 +522,33 @@ def connect_target(session: Any, target_type: str, target_value: str | int):
 
 
 def post_comment(username: str, target_type: str, target_value: str | int, message: str) -> str:
-    """投稿を直列化し、Scratch側のレート制限に配慮する。"""
-    global last_post_at
-    with sessions_lock:
-        session = sessions.get(username)
-    if session is None:
+    state = get_client_state()
+    with state.sessions_lock:
+        scratch_session = state.sessions.get(username)
+    if scratch_session is None:
         raise RuntimeError(f"{username} はログインされていません。")
-
-    with post_lock:
-        wait_for = MIN_POST_INTERVAL - (time.monotonic() - last_post_at)
+    with state.post_lock:
+        wait_for = MIN_POST_INTERVAL - (time.monotonic() - state.last_post_at)
         if wait_for > 0:
             time.sleep(wait_for)
-        target = connect_target(session, target_type, target_value)
+        target = connect_target(scratch_session, target_type, target_value)
         comment = target.post_comment(message)
-        last_post_at = time.monotonic()
+        state.last_post_at = time.monotonic()
         return str(getattr(comment, "id", "不明"))
 
-
 def reply_to_comment(username: str, comment: Any, message: str) -> str:
-    """コメントへの返信を直列化し、Scratch側のレート制限に配慮する。"""
-    global last_post_at
-    with sessions_lock:
-        session = sessions.get(username)
-    if session is None:
+    state = get_client_state()
+    with state.sessions_lock:
+        scratch_session = state.sessions.get(username)
+    if scratch_session is None:
         raise RuntimeError(f"{username} はログインされていません。")
-
-    with post_lock:
-        wait_for = MIN_POST_INTERVAL - (time.monotonic() - last_post_at)
+    with state.post_lock:
+        wait_for = MIN_POST_INTERVAL - (time.monotonic() - state.last_post_at)
         if wait_for > 0:
             time.sleep(wait_for)
-        # comments() が返す Comment は同じ認証セッションを持っているため、
-        # comment.reply() でProject/Studio/Profileを共通に扱える。
         posted = comment.reply(message)
-        last_post_at = time.monotonic()
+        state.last_post_at = time.monotonic()
         return str(getattr(posted, "id", "不明"))
-
 
 def post_for_accounts(usernames: list[str], target_type: str, target_value: str | int, message: str):
     sent: list[dict[str, str]] = []
@@ -452,66 +563,32 @@ def post_for_accounts(usernames: list[str], target_type: str, target_value: str 
 
 
 def load_schedules() -> list[dict[str, Any]]:
-    if not SCHEDULE_FILE.exists():
-        return []
-    try:
-        data = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
-
+    return _load_list_file(get_client_state().schedule_file)
 
 def save_schedules(items: list[dict[str, Any]]) -> None:
-    temporary = SCHEDULE_FILE.with_suffix(".tmp")
+    path = get_client_state().schedule_file
+    temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(SCHEDULE_FILE)
-
-
-schedules = load_schedules()
-
+    temporary.replace(path)
 
 def load_reaction_rules() -> list[dict[str, Any]]:
-    if not REACTION_FILE.exists():
-        return []
-    try:
-        data = json.loads(REACTION_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
-
+    return _load_list_file(get_client_state().reaction_file)
 
 def save_reaction_rules(items: list[dict[str, Any]] | None = None) -> None:
-    values = reaction_rules if items is None else items
-    temporary = REACTION_FILE.with_suffix(".tmp")
+    state = get_client_state()
+    values = state.reaction_rules if items is None else items
+    temporary = state.reaction_file.with_suffix(".tmp")
     temporary.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(REACTION_FILE)
-
+    temporary.replace(state.reaction_file)
 
 def load_reaction_state() -> dict[str, Any]:
-    if not REACTION_STATE_FILE.exists():
-        return {"initialized": {}, "seen": {}, "pending": {}, "pool": {}}
-    try:
-        data = json.loads(REACTION_STATE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError
-        data.setdefault("initialized", {})
-        data.setdefault("seen", {})
-        data.setdefault("pending", {})
-        data.setdefault("pool", {})
-        return data
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {"initialized": {}, "seen": {}, "pending": {}, "pool": {}}
-
+    return _load_reaction_state_file(get_client_state().reaction_state_file)
 
 def save_reaction_state() -> None:
-    temporary = REACTION_STATE_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(reaction_state, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(REACTION_STATE_FILE)
-
-
-reaction_rules = load_reaction_rules()
-reaction_state = load_reaction_state()
-
+    state = get_client_state()
+    temporary = state.reaction_state_file.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state.reaction_state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(state.reaction_state_file)
 
 def schedule_for_client(item: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -530,13 +607,13 @@ def schedule_for_client(item: dict[str, Any]) -> dict[str, Any]:
 def queue_for_client(item: dict[str, Any]) -> dict[str, Any]:
     result = dict(item)
     result.pop("_startedAt", None)
-    if result.get("status") == "waiting" and queue_batch_started_at is not None:
-        due = queue_batch_started_at + int(result.get("delaySeconds", 0))
+    batch_started_at = get_client_state().queue_batch_started_at
+    if result.get("status") == "waiting" and batch_started_at is not None:
+        due = batch_started_at + int(result.get("delaySeconds", 0))
         result["remainingSeconds"] = max(0, int(due - time.time() + 0.999))
     else:
         result["remainingSeconds"] = None
     return result
-
 
 def reaction_for_client(item: dict[str, Any]) -> dict[str, Any]:
     reaction_type = str(item.get("reactionType", "keyword") or "keyword")
@@ -765,98 +842,109 @@ def _find_comment_object(comments: list[Any], record: dict[str, Any], target: An
 
 
 def reaction_loop() -> None:
-    global reaction_thread
+    state = get_client_state()
     try:
-        while not reaction_stop_event.wait(1):
-            with reaction_lock:
-                if not reaction_running:
+        while not state.reaction_stop_event.wait(1):
+            with state.reaction_lock:
+                if not state.reaction_running:
                     break
                 now = time.monotonic()
                 due: list[dict[str, Any]] = []
-                for item in reaction_rules:
+                for item in state.reaction_rules:
                     if not item.get("enabled", True):
                         continue
                     rule_key = str(item.get("id"))
-                    if reaction_due_at.get(rule_key, 0) <= now:
+                    if state.reaction_due_at.get(rule_key, 0) <= now:
                         due.append(dict(item))
-                        reaction_due_at[rule_key] = now + max(15, int(item.get("pollSeconds", 30)))
+                        state.reaction_due_at[rule_key] = now + max(15, int(item.get("pollSeconds", 30)))
             for rule in due:
                 try:
                     process_reaction_rule(rule)
                 except Exception as exc:
                     _update_reaction_result(rule.get("id"), action="確認エラー", error=str(exc))
     finally:
-        reaction_thread = None
-
+        state.reaction_thread = None
 
 def start_reaction_thread() -> None:
-    global reaction_thread
-    with reaction_lock:
-        if reaction_thread is None or not reaction_thread.is_alive():
-            reaction_stop_event.clear()
-            reaction_thread = threading.Thread(target=reaction_loop, daemon=True, name="comment-reaction-bot")
-            reaction_thread.start()
-
+    state = get_client_state()
+    with state.reaction_lock:
+        if state.reaction_thread is None or not state.reaction_thread.is_alive():
+            state.reaction_stop_event.clear()
+            client_id = current_client_id()
+            state.reaction_thread = threading.Thread(
+                target=run_for_client,
+                args=(client_id, reaction_loop),
+                daemon=True,
+                name=f"comment-reaction-{client_id[:8]}",
+            )
+            state.reaction_thread.start()
 
 def scheduler_loop() -> None:
-    global schedules
     while True:
-        try:
-            now = datetime.now(JST)
-            today = now.date().isoformat()
-            post_time = now.strftime("%H:%M")
-            due_items: list[dict[str, Any]] = []
-            with schedules_lock:
-                for item in schedules:
-                    if item.get("enabled", True) and item.get("postTime") == post_time and item.get("lastRunDate") != today:
-                        item["lastRunDate"] = today
-                        item["lastError"] = None
-                        due_items.append(item.copy())
-            if due_items:
-                save_schedules(schedules)
-                for item in due_items:
-                    try:
-                        target_type, target_value = normalize_target(item["targetType"], item["targetId"])
-                        usernames = selected_usernames(item["accountUsername"])
-                        _, failed = post_for_accounts(usernames, target_type, target_value, clean_message(item["message"]))
-                        if failed:
-                            item["lastError"] = "; ".join(f"{x['username']}: {x['error']}" for x in failed)
-                            with schedules_lock:
-                                for original in schedules:
-                                    if original.get("id") == item.get("id"):
-                                        original["lastError"] = item["lastError"]
-                                        break
-                    except Exception as exc:
-                        with schedules_lock:
-                            for original in schedules:
+        now = datetime.now(JST)
+        today = now.date().isoformat()
+        post_time = now.strftime("%H:%M")
+        with _client_states_lock:
+            client_ids = list(_client_states.keys())
+        for client_id in client_ids:
+            token = _client_context.set(client_id)
+            try:
+                state = get_client_state(client_id)
+                due_items: list[dict[str, Any]] = []
+                with state.schedules_lock:
+                    for item in state.schedules:
+                        if item.get("enabled", True) and item.get("postTime") == post_time and item.get("lastRunDate") != today:
+                            item["lastRunDate"] = today
+                            item["lastError"] = None
+                            due_items.append(item.copy())
+                if due_items:
+                    save_schedules(state.schedules)
+                    for item in due_items:
+                        try:
+                            target_type, target_value = normalize_target(item["targetType"], item["targetId"])
+                            usernames = selected_usernames(item["accountUsername"])
+                            _, failed = post_for_accounts(usernames, target_type, target_value, clean_message(item["message"]))
+                            error = "; ".join(f"{x['username']}: {x['error']}" for x in failed) if failed else None
+                        except Exception as exc:
+                            error = str(exc)
+                        with state.schedules_lock:
+                            for original in state.schedules:
                                 if original.get("id") == item.get("id"):
-                                    original["lastError"] = str(exc)
+                                    original["lastError"] = error
                                     break
-                    save_schedules(schedules)
-        except Exception:
-            # スケジューラの例外でWebサーバーを止めない。
-            pass
+                            save_schedules(state.schedules)
+            except Exception:
+                pass
+            finally:
+                _client_context.reset(token)
         time.sleep(10)
 
 
+def ensure_scheduler_thread() -> None:
+    global _scheduler_thread
+    with _scheduler_thread_lock:
+        if _scheduler_thread is None or not _scheduler_thread.is_alive():
+            _scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True, name="daily-scheduler")
+            _scheduler_thread.start()
+
 def run_queue(batch_started: float, item_ids: list[int]) -> None:
-    global queue_running, queue_batch_started_at
+    state = get_client_state()
     try:
         for item_id in item_ids:
-            with queue_lock:
-                item = next((x for x in queue_items if x["id"] == item_id), None)
+            with state.queue_lock:
+                item = next((x for x in state.queue_items if x["id"] == item_id), None)
                 if item is None or item.get("status") != "waiting":
                     continue
                 delay = int(item.get("delaySeconds", 0))
             due = batch_started + delay
             while time.time() < due:
-                with queue_lock:
-                    if not queue_running:
+                with state.queue_lock:
+                    if not state.queue_running:
                         return
                 time.sleep(min(0.25, max(0.01, due - time.time())))
-            with queue_lock:
-                item = next((x for x in queue_items if x["id"] == item_id), None)
-                if item is None or not queue_running:
+            with state.queue_lock:
+                item = next((x for x in state.queue_items if x["id"] == item_id), None)
+                if item is None or not state.queue_running:
                     return
                 item["status"] = "sending"
                 item["startedAt"] = datetime.now(JST).isoformat(timespec="seconds")
@@ -864,21 +952,20 @@ def run_queue(batch_started: float, item_ids: list[int]) -> None:
                 target_type, target_value = normalize_target(item["targetType"], item["targetId"])
                 usernames = selected_usernames(item["accountUsername"])
                 sent, failed = post_for_accounts(usernames, target_type, target_value, clean_message(item["message"]))
-                with queue_lock:
+                with state.queue_lock:
                     item["sent"] = sent
                     item["failed"] = failed
                     item["status"] = "sent" if not failed else ("failed" if not sent else "partial")
                     item["finishedAt"] = datetime.now(JST).isoformat(timespec="seconds")
             except Exception as exc:
-                with queue_lock:
+                with state.queue_lock:
                     item["status"] = "failed"
                     item["failed"] = [{"error": str(exc)}]
                     item["finishedAt"] = datetime.now(JST).isoformat(timespec="seconds")
     finally:
-        with queue_lock:
-            queue_running = False
-            queue_batch_started_at = None
-
+        with state.queue_lock:
+            state.queue_running = False
+            state.queue_batch_started_at = None
 
 @app.get("/")
 def index():
@@ -887,28 +974,29 @@ def index():
 
 @app.get("/api/state")
 def state():
-    with sessions_lock:
-        account_list = [{"username": name} for name in sessions]
-    with schedules_lock:
-        schedule_list = [schedule_for_client(x) for x in schedules]
-    with queue_lock:
-        queue_list = [queue_for_client(item) for item in queue_items]
-        running = queue_running
-    with reaction_lock:
-        reaction_list = [reaction_for_client(item) for item in reaction_rules]
-        reaction_is_running = reaction_running
+    client = get_client_state()
+    with client.sessions_lock:
+        account_list = [{"username": name} for name in client.sessions]
+    with client.schedules_lock:
+        schedule_list = [schedule_for_client(x) for x in client.schedules]
+    with client.queue_lock:
+        queue_list = [queue_for_client(item) for item in client.queue_items]
+        running = client.queue_running
+        batch_started_at = client.queue_batch_started_at
+    with client.reaction_lock:
+        reaction_list = [reaction_for_client(item) for item in client.reaction_rules]
+        reaction_is_running = client.reaction_running
     return jsonify({
         "loggedIn": bool(account_list),
         "accounts": account_list,
         "schedules": schedule_list,
         "queue": queue_list,
         "queueRunning": running,
-        "queueBatchStartedAt": queue_batch_started_at,
+        "queueBatchStartedAt": batch_started_at,
         "reactions": reaction_list,
         "reactionRunning": reaction_is_running,
         "studioBulk": studio_bulk_job_for_client(),
     })
-
 
 @app.post("/api/login")
 def login():
@@ -935,18 +1023,18 @@ def login():
 @app.post("/api/logout")
 def logout():
     username = str(body().get("accountUsername") or "").strip()
-    with studio_bulk_state_lock:
+    state = get_client_state()
+    with state.studio_bulk_state_lock:
         if (
-            studio_bulk_job is not None
-            and studio_bulk_job.get("status") == "running"
-            and studio_bulk_job.get("accountUsername") == username
-            and studio_bulk_stop_event is not None
+            state.studio_bulk_job is not None
+            and state.studio_bulk_job.get("status") == "running"
+            and state.studio_bulk_job.get("accountUsername") == username
+            and state.studio_bulk_stop_event is not None
         ):
-            studio_bulk_stop_event.set()
-    with sessions_lock:
-        sessions.pop(username, None)
+            state.studio_bulk_stop_event.set()
+    with state.sessions_lock:
+        state.sessions.pop(username, None)
     return jsonify({"ok": True})
-
 
 def normalize_reaction_input(data: dict[str, Any]) -> dict[str, Any]:
     account = selected_single_username(data.get("accountUsername"))
@@ -1038,51 +1126,46 @@ def add_reaction_rule():
 
 @app.post("/api/reactions/start")
 def start_reactions():
-    global reaction_running
-    with reaction_lock:
-        if not any(item.get("enabled", True) for item in reaction_rules):
+    state = get_client_state()
+    with state.reaction_lock:
+        if not any(item.get("enabled", True) for item in state.reaction_rules):
             return json_error("ONになっている反応Botがありません。")
-        reaction_running = True
-        for item in reaction_rules:
+        state.reaction_running = True
+        for item in state.reaction_rules:
             if item.get("enabled", True):
-                reaction_due_at[str(item.get("id"))] = 0
-        reaction_stop_event.clear()
+                state.reaction_due_at[str(item.get("id"))] = 0
+        state.reaction_stop_event.clear()
         start_reaction_thread()
     return jsonify({"ok": True})
 
-
 @app.post("/api/reactions/stop")
 def stop_reactions():
-    global reaction_running
-    with reaction_lock:
-        reaction_running = False
-        reaction_stop_event.set()
+    state = get_client_state()
+    with state.reaction_lock:
+        state.reaction_running = False
+        state.reaction_stop_event.set()
     return jsonify({"ok": True})
-
 
 @app.post("/api/reactions/<int:reaction_id>/<action>")
 def reaction_action(reaction_id: int, action: str):
-    global reaction_rules
     if action not in {"toggle", "delete"}:
         return json_error("操作が不正です。")
-    with reaction_lock:
-        found = next((item for item in reaction_rules if int(item.get("id", -1)) == reaction_id), None)
+    state = get_client_state()
+    with state.reaction_lock:
+        found = next((item for item in state.reaction_rules if int(item.get("id", -1)) == reaction_id), None)
         if found is None:
             return json_error("反応Botが見つかりません。", 404)
         if action == "toggle":
             found["enabled"] = not bool(found.get("enabled", True))
             save_reaction_rules()
             return jsonify({"ok": True, "reaction": reaction_for_client(found)})
-        reaction_rules = [item for item in reaction_rules if int(item.get("id", -1)) != reaction_id]
-        reaction_state.get("initialized", {}).pop(str(reaction_id), None)
-        reaction_state.get("seen", {}).pop(str(reaction_id), None)
-        reaction_state.get("pending", {}).pop(str(reaction_id), None)
-        reaction_state.get("pool", {}).pop(str(reaction_id), None)
-        reaction_due_at.pop(str(reaction_id), None)
+        state.reaction_rules[:] = [item for item in state.reaction_rules if int(item.get("id", -1)) != reaction_id]
+        for bucket in ("initialized", "seen", "pending", "pool"):
+            state.reaction_state.get(bucket, {}).pop(str(reaction_id), None)
+        state.reaction_due_at.pop(str(reaction_id), None)
         save_reaction_rules()
         save_reaction_state()
     return jsonify({"ok": True})
-
 
 @app.post("/api/post-now")
 def post_now():
@@ -1099,13 +1182,14 @@ def post_now():
 
 @app.get("/api/queue")
 def get_queue():
-    with queue_lock:
-        return jsonify({"queue": [queue_for_client(x) for x in queue_items], "running": queue_running})
-
+    state = get_client_state()
+    with state.queue_lock:
+        return jsonify({"queue": [queue_for_client(x) for x in state.queue_items], "running": state.queue_running})
 
 @app.post("/api/queue")
 def add_queue_item():
     data = body()
+    state = get_client_state()
     try:
         selected_usernames(data.get("accountUsername"))
         target_type, target_value = normalize_target(data.get("targetType"), data.get("targetId"))
@@ -1115,13 +1199,13 @@ def add_queue_item():
             raise ValueError("投稿までの秒数は0〜86400秒で指定してください。")
     except (ValueError, TypeError):
         return json_error("入力内容を確認してください。")
-    with queue_lock:
-        if queue_running:
+    with state.queue_lock:
+        if state.queue_running:
             return json_error("一括投稿中はキューを変更できません。")
-        if len(queue_items) >= MAX_QUEUE_ITEMS:
+        if len(state.queue_items) >= MAX_QUEUE_ITEMS:
             return json_error(f"キューは最大{MAX_QUEUE_ITEMS}件です。")
-        new_id = max((int(x["id"]) for x in queue_items), default=0) + 1
-        queue_items.append({
+        new_id = max((int(x["id"]) for x in state.queue_items), default=0) + 1
+        state.queue_items.append({
             "id": new_id,
             "accountUsername": str(data.get("accountUsername")),
             "targetType": target_type,
@@ -1133,89 +1217,93 @@ def add_queue_item():
             "failed": [],
             "createdAt": datetime.now(JST).isoformat(timespec="seconds"),
         })
-        return jsonify({"ok": True, "item": queue_for_client(queue_items[-1])})
-
+        return jsonify({"ok": True, "item": queue_for_client(state.queue_items[-1])})
 
 @app.post("/api/queue/start")
 def start_queue():
-    global queue_running, queue_batch_started_at
-    with queue_lock:
-        if queue_running:
+    state = get_client_state()
+    with state.queue_lock:
+        if state.queue_running:
             return json_error("一括投稿はすでに実行中です。")
-        pending = [x for x in queue_items if x.get("status") == "queued"]
+        pending = [x for x in state.queue_items if x.get("status") == "queued"]
         if not pending:
             return json_error("投稿待ちのコメントがありません。")
-        queue_running = True
-        queue_batch_started_at = time.time()
-        batch_started = queue_batch_started_at
+        state.queue_running = True
+        state.queue_batch_started_at = time.time()
+        batch_started = state.queue_batch_started_at
         item_ids = []
         for item in pending:
             item["status"] = "waiting"
             item_ids.append(int(item["id"]))
-        thread = threading.Thread(target=run_queue, args=(batch_started, item_ids), daemon=True)
-        thread.start()
+        client_id = current_client_id()
+        threading.Thread(
+            target=run_for_client,
+            args=(client_id, run_queue, batch_started, item_ids),
+            daemon=True,
+            name=f"queue-{client_id[:8]}",
+        ).start()
     return jsonify({"ok": True, "startedAt": batch_started, "count": len(item_ids)})
-
 
 @app.post("/api/queue/repeat")
 def repeat_queue():
-    global queue_running, queue_batch_started_at
-    with queue_lock:
-        if queue_running:
+    state = get_client_state()
+    with state.queue_lock:
+        if state.queue_running:
             return json_error("一括投稿はすでに実行中です。")
-        if not queue_items:
+        if not state.queue_items:
             return json_error("繰り返す投稿キューがありません。")
-        if all(item.get("status") == "queued" for item in queue_items):
+        if all(item.get("status") == "queued" for item in state.queue_items):
             return json_error("まだ実行済みのキューがありません。一括開始を使ってください。")
-
-        queue_running = True
-        queue_batch_started_at = time.time()
-        batch_started = queue_batch_started_at
+        state.queue_running = True
+        state.queue_batch_started_at = time.time()
+        batch_started = state.queue_batch_started_at
         item_ids = []
-        for item in queue_items:
+        for item in state.queue_items:
             item["status"] = "waiting"
             item["sent"] = []
             item["failed"] = []
             item.pop("startedAt", None)
             item.pop("finishedAt", None)
             item_ids.append(int(item["id"]))
-
-        thread = threading.Thread(target=run_queue, args=(batch_started, item_ids), daemon=True)
-        thread.start()
+        client_id = current_client_id()
+        threading.Thread(
+            target=run_for_client,
+            args=(client_id, run_queue, batch_started, item_ids),
+            daemon=True,
+            name=f"queue-repeat-{client_id[:8]}",
+        ).start()
     return jsonify({"ok": True, "startedAt": batch_started, "count": len(item_ids)})
-
 
 @app.post("/api/queue/stop")
 def stop_queue():
-    global queue_running
-    with queue_lock:
-        queue_running = False
-        for item in queue_items:
+    state = get_client_state()
+    with state.queue_lock:
+        state.queue_running = False
+        for item in state.queue_items:
             if item.get("status") == "waiting":
                 item["status"] = "cancelled"
     return jsonify({"ok": True})
 
-
 @app.post("/api/queue/clear")
 def clear_queue():
-    with queue_lock:
-        if queue_running:
+    state = get_client_state()
+    with state.queue_lock:
+        if state.queue_running:
             return json_error("一括投稿中はキューを空にできません。")
-        queue_items.clear()
+        state.queue_items.clear()
     return jsonify({"ok": True})
-
 
 @app.post("/api/queue/<int:item_id>/delete")
 def delete_queue_item(item_id: int):
-    with queue_lock:
-        if queue_running:
+    state = get_client_state()
+    with state.queue_lock:
+        if state.queue_running:
             return json_error("一括投稿中はキューを変更できません。")
-        before = len(queue_items)
-        queue_items[:] = [x for x in queue_items if int(x["id"]) != item_id]
-        if len(queue_items) == before:
+        before = len(state.queue_items)
+        state.queue_items[:] = [x for x in state.queue_items if int(x["id"]) != item_id]
+        if len(state.queue_items) == before:
             return json_error("キュー項目が見つかりません。", 404)
     return jsonify({"ok": True})
-
 
 @app.post("/api/studio/inspect")
 def inspect_owned_studio():
@@ -1242,26 +1330,19 @@ STUDIO_BULK_LABELS = {
 
 
 def start_studio_bulk_job(kind: str, data: dict[str, Any]):
-    """所有確認済みStudioの指定カテゴリを順番に整理するジョブを開始する。"""
-    global studio_bulk_job, studio_bulk_stop_event, studio_bulk_thread
+    state = get_client_state()
     if data.get("confirm") is not True:
         return json_error("操作確認が必要です。画面の確認ダイアログから実行してください。")
     if kind not in STUDIO_BULK_LABELS:
         return json_error("一括整理対象が不正です。")
-
     try:
         username = selected_single_username(data.get("accountUsername"))
         studio_id = normalize_studio_id(data.get("studioId"))
         _, studio = owned_studio(username, studio_id)
         targets = studio_bulk_targets(username, studio, kind)
         expected_count = data.get("expectedCount")
-        if expected_count is not None:
-            try:
-                expected_count = int(expected_count)
-            except (TypeError, ValueError):
-                raise ValueError("確認した件数が不正です。")
-            if expected_count != len(targets):
-                raise ValueError("対象件数が変わりました。スタジオを再読み込みしてから実行してください。")
+        if expected_count is not None and int(expected_count) != len(targets):
+            raise ValueError("対象件数が変わりました。スタジオを再読み込みしてから実行してください。")
     except PermissionError as exc:
         return json_error(str(exc), 403)
     except (ValueError, TypeError) as exc:
@@ -1272,13 +1353,13 @@ def start_studio_bulk_job(kind: str, data: dict[str, Any]):
     if not targets:
         return jsonify({"ok": True, "started": False, "total": 0, "message": f"{STUDIO_BULK_LABELS[kind]}の対象はありません。"})
 
-    with studio_bulk_state_lock:
+    with state.studio_bulk_state_lock:
         if (
-            (studio_bulk_job is not None and studio_bulk_job.get("status") == "running")
-            or (studio_bulk_thread is not None and studio_bulk_thread.is_alive())
+            (state.studio_bulk_job is not None and state.studio_bulk_job.get("status") == "running")
+            or (state.studio_bulk_thread is not None and state.studio_bulk_thread.is_alive())
         ):
             return json_error("すでに一括整理が実行中です。", 409)
-        studio_bulk_stop_event = threading.Event()
+        state.studio_bulk_stop_event = threading.Event()
         job = {
             "status": "running",
             "accountUsername": username,
@@ -1293,16 +1374,16 @@ def start_studio_bulk_job(kind: str, data: dict[str, Any]):
             "startedAt": datetime.now(JST).isoformat(timespec="seconds"),
             "finishedAt": None,
         }
-        studio_bulk_job = job
-        studio_bulk_thread = threading.Thread(
-            target=run_studio_bulk_remove,
-            args=(username, studio_id, targets, studio_bulk_stop_event, job, kind),
+        state.studio_bulk_job = job
+        client_id = current_client_id()
+        state.studio_bulk_thread = threading.Thread(
+            target=run_for_client,
+            args=(client_id, run_studio_bulk_remove, username, studio_id, targets, state.studio_bulk_stop_event, job, kind),
             daemon=True,
-            name=f"studio-{kind}-bulk-cleanup",
+            name=f"studio-{kind}-{client_id[:8]}",
         )
-        studio_bulk_thread.start()
+        state.studio_bulk_thread.start()
     return jsonify({"ok": True, "started": True, "total": len(targets), "kind": kind})
-
 
 @app.post("/api/studio/bulk/start")
 def start_studio_bulk_cleanup():
@@ -1319,24 +1400,22 @@ def start_studio_bulk_remove():
 @app.post("/api/studio/bulk/stop")
 @app.post("/api/studio/projects/remove-all/stop")
 def stop_studio_bulk_remove():
-    """実行中の一括整理を次の項目から停止する。"""
     data = body()
+    state = get_client_state()
     try:
         username = selected_single_username(data.get("accountUsername"))
         studio_id = normalize_studio_id(data.get("studioId"))
     except (ValueError, TypeError) as exc:
         return json_error(str(exc))
-
-    with studio_bulk_state_lock:
-        job = studio_bulk_job
+    with state.studio_bulk_state_lock:
+        job = state.studio_bulk_job
         if job is None or job.get("status") != "running":
             return json_error("実行中の一括整理はありません。", 409)
         if job.get("accountUsername") != username or str(job.get("studioId")) != str(studio_id):
             return json_error("別のスタジオの一括整理は停止できません。", 403)
-        if studio_bulk_stop_event is not None:
-            studio_bulk_stop_event.set()
+        if state.studio_bulk_stop_event is not None:
+            state.studio_bulk_stop_event.set()
     return jsonify({"ok": True, "stopping": True})
-
 
 @app.post("/api/studio/action")
 def studio_action():
@@ -1400,8 +1479,8 @@ def studio_action():
 
 @app.post("/api/schedules")
 def add_schedule():
-    global schedules
     data = body()
+    state = get_client_state()
     try:
         selected_usernames(data.get("accountUsername"))
         target_type, target_value = normalize_target(data.get("targetType"), data.get("targetId"))
@@ -1411,18 +1490,18 @@ def add_schedule():
             raise ValueError("投稿時刻はHH:MM形式で入力してください。")
     except (ValueError, TypeError) as exc:
         return json_error(str(exc))
-    with schedules_lock:
+    with state.schedules_lock:
         duplicate = any(
             x.get("accountUsername") == str(data.get("accountUsername"))
             and x.get("targetType") == target_type
             and str(x.get("targetId")) == str(target_value)
             and x.get("postTime") == post_time
             and x.get("message") == message
-            for x in schedules
+            for x in state.schedules
         )
         if duplicate:
             return json_error("同じ内容の予約がすでにあります。")
-        new_id = max((int(x.get("id", 0)) for x in schedules), default=0) + 1
+        new_id = max((int(x.get("id", 0)) for x in state.schedules), default=0) + 1
         item = {
             "id": new_id,
             "accountUsername": str(data.get("accountUsername")),
@@ -1434,36 +1513,35 @@ def add_schedule():
             "lastRunDate": None,
             "lastError": None,
         }
-        schedules.append(item)
-        schedules.sort(key=lambda x: (x.get("postTime", "99:99"), int(x.get("id", 0))))
-        save_schedules(schedules)
+        state.schedules.append(item)
+        state.schedules.sort(key=lambda x: (x.get("postTime", "99:99"), int(x.get("id", 0))))
+        save_schedules(state.schedules)
     return jsonify({"ok": True, "schedule": schedule_for_client(item)})
-
 
 @app.post("/api/schedules/<int:schedule_id>/<action>")
 def schedule_action(schedule_id: int, action: str):
-    global schedules
+    state = get_client_state()
     if action not in {"toggle", "delete"}:
-        return json_error("操作が不正です.")
+        return json_error("操作が不正です。")
     if action == "delete":
-        with schedules_lock:
-            before = len(schedules)
-            schedules = [x for x in schedules if int(x.get("id", -1)) != schedule_id]
-            if len(schedules) == before:
+        with state.schedules_lock:
+            before = len(state.schedules)
+            state.schedules[:] = [x for x in state.schedules if int(x.get("id", -1)) != schedule_id]
+            if len(state.schedules) == before:
                 return json_error("予約が見つかりません。", 404)
-            save_schedules(schedules)
+            save_schedules(state.schedules)
         return jsonify({"ok": True})
-    with schedules_lock:
-        for item in schedules:
+    with state.schedules_lock:
+        for item in state.schedules:
             if int(item.get("id", -1)) == schedule_id:
                 item["enabled"] = not bool(item.get("enabled", True))
-                save_schedules(schedules)
+                save_schedules(state.schedules)
                 return jsonify({"ok": True, "schedule": schedule_for_client(item)})
     return json_error("予約が見つかりません。", 404)
 
+ensure_scheduler_thread()
 
 if __name__ == "__main__":
-    threading.Thread(target=scheduler_loop, daemon=True, name="daily-scheduler").start()
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "18876"))
     print(f"Scratch Comment Bot: http://{host}:{port}/")

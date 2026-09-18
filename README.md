@@ -100,3 +100,19 @@ Scratchユーザー名 またはプロフィールURL: ExampleUser
 - `post_log.jsonl` : 投稿成功 / 失敗の履歴
 
 Scratchのパスワードはこれらのファイルには保存しません。
+
+
+## 公開時のユーザー分離
+
+ブラウザ版は匿名の `scb_client` Cookie を発行し、ブラウザごとに次の状態を分離します。
+
+- Scratchログインセッション
+- 投稿キューと実行状態
+- 毎日予約
+- コメント反応Bot
+- 所有スタジオ整理ジョブ
+
+予約・反応Botの設定ファイルも `scratch-comment-bot-python/client-data/<client_id>/` 以下へ分離して保存します。
+Scratchパスワードは保存しません。別ブラウザ・シークレットウィンドウは別ユーザーとして扱われます。
+
+Renderでは `render.yaml` の設定どおり Gunicorn 1 worker で動かしてください。
