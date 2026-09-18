@@ -243,7 +243,7 @@ bot.run()</pre>
     </div>
     <div class="layout">
       <aside class="sidebar">
-        <section class="section login-card"><div class="section-header">Scratchログイン</div><div class="section-body" id="login-panel"><form id="login-form"><div class="field"><label>ユーザー名</label><input name="username" autocomplete="username" placeholder="Scratchユーザー名" required=""></div><div class="field"><label>パスワード</label><input type="password" name="password" autocomplete="current-password" placeholder="••••••••" required=""></div><div class="actions"><button class="primary">ログイン</button></div></form><div class="help">複数アカウントを保存できます。パスワードは保存せず、投稿用セッションだけ暗号化して保存します。</div></div></section>
+        <section class="section login-card"><div class="section-header">Scratchログイン</div><div class="section-body" id="login-panel"><form id="login-form"><div class="field"><label>ユーザー名</label><input name="username" autocomplete="username" placeholder="Scratchユーザー名" required=""></div><div class="field"><label>パスワード</label><input type="password" name="password" autocomplete="current-password" placeholder="Scratchパスワード" required=""></div><div class="actions"><button class="primary">ログイン</button></div></form><div class="help">複数アカウントを保存できます。パスワードは保存せず、投稿用セッションだけ暗号化して保存します。</div></div></section>
         <section class="section post-card">
           <div class="section-header">投稿する文字をキューへ追加</div>
           <div class="section-body">
@@ -330,15 +330,19 @@ bot.run()</pre>
     function notice(message,type='success'){ $('#notices').innerHTML=`<div class="notice ${type}">${esc(message)}</div>`; scrollTo({top:0,behavior:'smooth'}); }
     async function api(path,options={}){ const response=await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}}); const data=await response.json(); if(!response.ok) throw new Error(data.error||'通信に失敗しました。'); return data; }
     function formData(form){ return Object.fromEntries(new FormData(form)); }
+    function isEditingForm(){
+      const el=document.activeElement;
+      return !!(el&&el.matches&&el.matches('input, textarea, select')&&el.closest('form'));
+    }
     async function refresh(){
-      try{ state=await api('/api/state'); render(); }
+      try{ state=await api('/api/state'); if(!isEditingForm()) render(); }
       catch(e){ notice(e.message,'error'); }
       clearTimeout(refreshTimer); refreshTimer=setTimeout(refresh,(state.queueRunning||state.reactionRunning||(state.studioBulk&&state.studioBulk.status==='running'))?1000:5000);
     }
     function render(){
       $('#account').textContent=state.accounts.length?`${state.accounts.length}アカウントでログイン中`:'未ログイン';
       const accountRows=state.accounts.map(a=>`<div class="account-row"><strong>${esc(a.username)}</strong><button class="danger" data-logout="${esc(a.username)}">ログアウト</button></div>`).join('');
-      $('#login-panel').innerHTML=`${accountRows?`<div class="account-list">${accountRows}</div>`:''}<form id="login-form"><div class="field"><label>ユーザー名</label><input name="username" autocomplete="username" placeholder="Scratchユーザー名" required></div><div class="field"><label>パスワード</label><input type="password" name="password" autocomplete="current-password" placeholder="••••••••" required></div><div class="actions"><button class="primary">${state.accounts.length?'別のアカウントを追加':'ログイン'}</button></div></form><div class="help">パスワードは保存せず、投稿用セッションだけメモリに保持します。</div>`;
+      $('#login-panel').innerHTML=`${accountRows?`<div class="account-list">${accountRows}</div>`:''}<form id="login-form"><div class="field"><label>ユーザー名</label><input name="username" autocomplete="username" placeholder="Scratchユーザー名" required></div><div class="field"><label>パスワード</label><input type="password" name="password" autocomplete="current-password" placeholder="Scratchパスワード" required></div><div class="actions"><button class="primary">${state.accounts.length?'別のアカウントを追加':'ログイン'}</button></div></form><div class="help">パスワードは保存せず、投稿用セッションだけメモリに保持します。</div>`;
       document.querySelectorAll('[data-logout]').forEach(b=>b.onclick=()=>run(b,async()=>{await api('/api/logout',{method:'POST',body:JSON.stringify({accountUsername:b.dataset.logout})});if(studioView&&studioView.owner===b.dataset.logout)studioView=null;notice(`${b.dataset.logout} をログアウトしました。`);await refresh()}));
       $('#login-form').onsubmit=e=>{e.preventDefault();run(e.submitter,async()=>{await api('/api/login',{method:'POST',body:JSON.stringify(formData(e.target))});notice('アカウントを追加しました。');e.target.reset();await refresh()})};
       const accountOptions=state.accounts.length>1?`<option value="*">すべてのアカウント</option>${state.accounts.map(a=>`<option value="${esc(a.username)}">${esc(a.username)}</option>`).join('')}`:state.accounts.map(a=>`<option value="${esc(a.username)}">${esc(a.username)}</option>`).join('');
