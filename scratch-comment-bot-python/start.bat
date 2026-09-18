@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 title Scratch Comment Bot - Python
 
-if not defined PORT set PORT=8876
+if not defined PORT set PORT=18876
 if not defined HOST set HOST=127.0.0.1
 echo ================================================
 echo  Scratch Comment Bot - Python
