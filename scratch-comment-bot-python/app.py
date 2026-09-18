@@ -34,6 +34,14 @@ JST = ZoneInfo("Asia/Tokyo")
 
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
 
+@app.after_request
+def disable_browser_cache(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 # セッションはメモリにだけ保持する。パスワードは保存しない。
 sessions: dict[str, Any] = {}
 sessions_lock = threading.RLock()
@@ -1457,7 +1465,7 @@ def schedule_action(schedule_id: int, action: str):
 if __name__ == "__main__":
     threading.Thread(target=scheduler_loop, daemon=True, name="daily-scheduler").start()
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8876"))
+    port = int(os.environ.get("PORT", "18876"))
     print(f"Scratch Comment Bot: http://{host}:{port}/")
     print("パスワードは保存せず、ログイン中だけメモリに保持します。")
     open_browser = os.environ.get("OPEN_BROWSER", "1").strip().lower() not in {"0", "false", "no", "off"}
