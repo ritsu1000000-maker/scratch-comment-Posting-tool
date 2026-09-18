@@ -4,7 +4,7 @@ cd /d "%~dp0"
 title Scratch Comment Bot - Web UI
 
 rem Avoid collisions with other local web apps that may already use port 8765.
-set PORT=8876
+set PORT=118876
 
 echo ================================================
 echo  Scratch Comment Bot - Web UI
