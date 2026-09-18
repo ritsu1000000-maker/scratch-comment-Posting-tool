@@ -1,25 +1,21 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+title Scratch Comment Bot - Web UI
 
-where py >nul 2>nul
-if %errorlevel%==0 (
-    py main_multi.py
-    goto :end
+echo ================================================
+echo  Scratch Comment Bot - Web UI
+echo  Browser will open automatically.
+echo ================================================
+echo.
+
+if not exist "start_browser.bat" (
+    echo start_browser.bat was not found.
+    echo Run this file from the repository root.
+    echo.
+    pause
+    exit /b 1
 )
 
-where python >nul 2>nul
-if %errorlevel%==0 (
-    python main_multi.py
-    goto :end
-)
-
-echo Python was not found.
-echo Install Python and enable "Add python.exe to PATH".
-echo.
-pause
-exit /b 1
-
-:end
-echo.
-pause
+call "start_browser.bat"
+exit /b %errorlevel%

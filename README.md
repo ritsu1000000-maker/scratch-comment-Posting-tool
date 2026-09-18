@@ -34,12 +34,24 @@ python -m pip install -r requirements.txt
 
 ## 起動
 
-`start.bat` をダブルクリックします。
+### Web版（既定）
+
+リポジトリ直下の `start.bat` をダブルクリックすると、FlaskのWeb版を起動してブラウザを自動で開きます。
+
+```text
+http://127.0.0.1:8765/
+```
+
+初回起動時は `scratch-comment-bot-python/requirements.txt` の依存関係を自動でインストールします。
+
+### CLI版
+
+従来のコマンドプロンプト版を使う場合は、リポジトリ直下の `start_cli.bat` をダブルクリックしてください。
 
 または:
 
 ```bash
-python main.py
+python main_multi.py
 ```
 
 ## 毎日・無期限予約の例
