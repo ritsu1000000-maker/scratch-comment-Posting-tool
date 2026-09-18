@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 title Scratch Comment Bot - Browser UI
 
-set PORT=8876
+set PORT=18876
 set HOST=127.0.0.1
 set OPEN_BROWSER=1
 
