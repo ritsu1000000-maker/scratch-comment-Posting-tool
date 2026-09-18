@@ -39,7 +39,7 @@ python -m pip install -r requirements.txt
 リポジトリ直下の `start.bat` をダブルクリックすると、FlaskのWeb版を起動してブラウザを自動で開きます。
 
 ```text
-http://127.0.0.1:8765/
+http://127.0.0.1:8876/
 ```
 
 初回起動時は `scratch-comment-bot-python/requirements.txt` の依存関係を自動でインストールします。
@@ -78,7 +78,7 @@ Scratchユーザー名 またはプロフィールURL: ExampleUser
 
 ## ブラウザ版
 
-ブラウザ画面と所有スタジオ整理を使う場合は、リポジトリ直下の`start_browser.bat`をダブルクリックしてください。内部の` scratch-comment-bot-python `を起動し、`http://127.0.0.1:8765/`を自動で開きます。直接起動する場合は` scratch-comment-bot-python/start.bat `を使います。
+ブラウザ画面と所有スタジオ整理を使う場合は、リポジトリ直下の`start_browser.bat`をダブルクリックしてください。内部の` scratch-comment-bot-python `を起動し、`http://127.0.0.1:8876/`を自動で開きます。直接起動する場合は` scratch-comment-bot-python/start.bat `を使います。
 
 ブラウザ版には、所有確認つきのスタジオ整理（プロジェクトをスタジオから外す、コメント削除、キュレーター・マネージャー・メンバー除外）が含まれています。
 
